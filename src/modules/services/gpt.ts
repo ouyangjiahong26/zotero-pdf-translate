@@ -99,6 +99,20 @@ function parseResponsesApiNonStreamResponse(obj: any): string {
 }
 
 function parseStreamResponse(obj: any): ParsedResponse {
+  // Handle Anthropic format (stream events carry a type field)
+  if (typeof obj.type === "string") {
+    if (obj.type === "content_block_delta") {
+      return {
+        content: obj.delta?.text || "",
+        finished: false,
+      };
+    }
+    if (obj.type === "message_stop") {
+      return { content: "", finished: true };
+    }
+    // message_start, content_block_start/stop, ping, etc.
+    return { content: "", finished: false };
+  }
   // Handle OpenAI format (choices array with delta)
   if (obj.choices && obj.choices[0]) {
     const choice = obj.choices[0];
@@ -119,6 +133,13 @@ function parseStreamResponse(obj: any): ParsedResponse {
 }
 
 function parseNonStreamResponse(obj: any): string {
+  // Handle Anthropic format (content blocks; thinking blocks are skipped)
+  if (Array.isArray(obj.content)) {
+    const textBlock = obj.content.find(
+      (block: { type?: string; text?: string }) => block.type === "text",
+    );
+    return textBlock?.text || "";
+  }
   // Handle OpenAI format (choices array)
   if (obj.choices && obj.choices[0]) {
     return obj.choices[0].message.content || "";
@@ -138,6 +159,7 @@ const gptTranslate = async function (
   data: Parameters<TranslateService["translate"]>[0],
   stream?: boolean,
   thinkingLevel?: string,
+  apiFormat?: string,
 ) {
   function transformContent(
     langFrom: string,
@@ -154,7 +176,11 @@ const gptTranslate = async function (
   }
 
   const streamMode = stream ?? true;
-  const useResponsesApi = isResponsesApiEndpoint(apiURL);
+  const useAnthropicApi = apiFormat === "anthropic";
+  const useResponsesApi = !useAnthropicApi && isResponsesApiEndpoint(apiURL);
+  // Both the Responses API and the Anthropic API interleave "event:" lines
+  // with "data:" lines, so both need line-based SSE parsing
+  const lineBasedSse = useResponsesApi || useAnthropicApi;
 
   const refreshHandler = addon.api.getTemporaryRefreshHandler({ task: data });
 
@@ -183,8 +209,9 @@ const gptTranslate = async function (
         // OpenAI SSE format
         // Prepend buffer from previous incomplete chunk
         const fullResponse = buffer + newResponse;
-        if (useResponsesApi) {
-          // Responses API has "event:" lines, need line-by-line parsing
+        if (lineBasedSse) {
+          // Responses/Anthropic APIs have "event:" lines, need line-by-line
+          // parsing
           dataArray = fullResponse
             .split("\n")
             .filter((line: string) => line.startsWith("data:"))
@@ -268,24 +295,40 @@ const gptTranslate = async function (
   // Thinking parameters are dialect-specific; custom params are filtered
   // against them so Custom Request stays usable as an escape hatch on
   // endpoints whose provider is not detected
-  const thinkingParams = buildThinkingParams(
-    apiURL,
-    model,
-    thinkingLevel ?? "default",
-  );
+  let anthropicMaxTokens: number | undefined;
+  let thinkingParams: Record<string, unknown>;
+  if (useAnthropicApi) {
+    // https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+    // The API requires max_tokens to be greater than thinking.budget_tokens
+    const thinkingBudgets = { low: 2048, medium: 8192, high: 16384 };
+    if (thinkingLevel === "off") {
+      thinkingParams = { thinking: { type: "disabled" } };
+    } else if (
+      thinkingLevel === "low" ||
+      thinkingLevel === "medium" ||
+      thinkingLevel === "high"
+    ) {
+      const budget = thinkingBudgets[thinkingLevel];
+      thinkingParams = {
+        thinking: { type: "enabled", budget_tokens: budget },
+      };
+      anthropicMaxTokens = Math.max(4000, budget + 1024);
+    } else {
+      thinkingParams = {};
+    }
+  } else {
+    thinkingParams = buildThinkingParams(
+      apiURL,
+      model,
+      thinkingLevel ?? "default",
+    );
+  }
 
   // Build request body based on API type
-  const requestBody = useResponsesApi
+  const requestBody = useAnthropicApi
     ? {
         model: model,
-        input: transformContent(data.langfrom, data.langto, data.raw),
-        temperature: temperature,
-        stream: streamMode,
-        ...thinkingParams,
-        ...getCustomParams(prefix, Object.keys(thinkingParams)),
-      }
-    : {
-        model: model,
+        max_tokens: anthropicMaxTokens ?? 4000,
         messages: [
           {
             role: "user",
@@ -295,15 +338,48 @@ const gptTranslate = async function (
         temperature: temperature,
         stream: streamMode,
         ...thinkingParams,
-        ...getCustomParams(prefix, Object.keys(thinkingParams)),
+        ...getCustomParams(prefix, [
+          ...Object.keys(thinkingParams),
+          "max_tokens",
+        ]),
+      }
+    : useResponsesApi
+      ? {
+          model: model,
+          input: transformContent(data.langfrom, data.langto, data.raw),
+          temperature: temperature,
+          stream: streamMode,
+          ...thinkingParams,
+          ...getCustomParams(prefix, Object.keys(thinkingParams)),
+        }
+      : {
+          model: model,
+          messages: [
+            {
+              role: "user",
+              content: transformContent(data.langfrom, data.langto, data.raw),
+            },
+          ],
+          temperature: temperature,
+          stream: streamMode,
+          ...thinkingParams,
+          ...getCustomParams(prefix, Object.keys(thinkingParams)),
+        };
+
+  const requestHeaders = useAnthropicApi
+    ? {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": data.secret,
+      }
+    : {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${data.secret}`,
+        "api-key": data.secret,
       };
 
   const xhr = await Zotero.HTTP.request("POST", apiURL, {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${data.secret}`,
-      "api-key": data.secret,
-    },
+    headers: requestHeaders,
     body: JSON.stringify(requestBody),
     responseType: "text",
     requestObserver: (xmlhttp: XMLHttpRequest) => {
@@ -327,9 +403,9 @@ function createGPTService(id: ID): TranslateService {
   // Additionally, customGPT was not initialized in prefs.js.
   const prefPrefix = id.replace("gpt", "GPT") as
     | "chatGPT"
-    // | "customGPT1"
-    // | "customGPT2"
-    // | "customGPT3"
+    | "customGPT1"
+    | "customGPT2"
+    | "customGPT3"
     | "azureGPT";
 
   return {
@@ -417,6 +493,12 @@ function createGPTService(id: ID): TranslateService {
           const thinkingLevel = getPref(
             `${prefPrefix}.thinkingLevel`,
           ) as string;
+          const apiFormat =
+            prefPrefix === "customGPT1" ||
+            prefPrefix === "customGPT2" ||
+            prefPrefix === "customGPT3"
+              ? (getPref(`${prefPrefix}.apiFormat`) as string)
+              : undefined;
 
           return await gptTranslate(
             apiURL,
@@ -426,6 +508,7 @@ function createGPTService(id: ID): TranslateService {
             data,
             stream,
             thinkingLevel,
+            apiFormat,
           );
         }
 
@@ -464,6 +547,39 @@ function createGPTService(id: ID): TranslateService {
           nameKey: `service-${servicePrefix}-dialog-apiVersion`,
           hidden: id !== "azuregpt",
         });
+      }
+      if (
+        prefPrefix === "customGPT1" ||
+        prefPrefix === "customGPT2" ||
+        prefPrefix === "customGPT3"
+      ) {
+        settings
+          .addSelectSetting({
+            prefKey: `${prefPrefix}.apiFormat`,
+            nameKey: "service-chatgpt-dialog-apiFormat",
+            options: [
+              {
+                value: "openai",
+                label: getString("service-dialog-api-format-openai"),
+              },
+              {
+                value: "anthropic",
+                label: getString("service-dialog-api-format-anthropic"),
+              },
+            ],
+          })
+          .addStaticRow("", {
+            tag: "div",
+            namespace: "html",
+            styles: {
+              color: "var(--fill-secondary)",
+              fontSize: "0.9em",
+              maxWidth: "400px",
+            },
+            properties: {
+              textContent: getString("service-gpt-dialog-apiFormat-hint"),
+            },
+          });
       }
 
       settings
